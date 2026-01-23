@@ -36,6 +36,8 @@ const (
 	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
 	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
 
+	grafanaSessionCookieEnvVar = "GRAFANA_SESSION_COOKIE"
+
 	grafanaURLHeader    = "X-Grafana-URL"
 	grafanaAPIKeyHeader = "X-Grafana-API-Key"
 )
@@ -68,6 +70,10 @@ func userAndPassFromEnv() *url.Userinfo {
 		return url.User(username)
 	}
 	return url.UserPassword(username, password)
+}
+
+func sessionCookieFromEnv() string {
+	return os.Getenv(grafanaSessionCookieEnvVar)
 }
 
 func orgIdFromEnv() int64 {
@@ -156,6 +162,10 @@ type GrafanaConfig struct {
 	// A Timeout of zero means no timeout.
 	// Default is 10 seconds.
 	Timeout time.Duration
+
+	// SessionCookie is the grafana_session cookie value for cookie-based authentication.
+	// This is useful when using SSO (like Okta) where service account tokens are not available.
+	SessionCookie string
 }
 
 const (
@@ -320,6 +330,38 @@ func NewOrgIDRoundTripper(rt http.RoundTripper, orgID int64) *OrgIDRoundTripper 
 	}
 }
 
+// CookieRoundTripper wraps an http.RoundTripper to add a session cookie for authentication.
+// This is useful for SSO environments (like Okta) where service account tokens are not available.
+type CookieRoundTripper struct {
+	underlying    http.RoundTripper
+	sessionCookie string
+}
+
+func (t *CookieRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// clone the request to avoid modifying the original
+	clonedReq := req.Clone(req.Context())
+
+	if t.sessionCookie != "" {
+		clonedReq.AddCookie(&http.Cookie{
+			Name:  "grafana_session",
+			Value: t.sessionCookie,
+		})
+	}
+
+	return t.underlying.RoundTrip(clonedReq)
+}
+
+func NewCookieRoundTripper(rt http.RoundTripper, sessionCookie string) *CookieRoundTripper {
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+
+	return &CookieRoundTripper{
+		underlying:    rt,
+		sessionCookie: sessionCookie,
+	}
+}
+
 // Gets info from environment
 func extractKeyGrafanaInfoFromEnv() (url, apiKey string, auth *url.Userinfo, orgId int64) {
 	url, apiKey = urlAndAPIKeyFromEnv()
@@ -372,7 +414,8 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 		panic(fmt.Errorf("invalid Grafana URL %s: %w", u, err))
 	}
 
-	slog.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "org_id", orgID)
+	sessionCookie := sessionCookieFromEnv()
+	slog.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "session_cookie_set", sessionCookie != "", "org_id", orgID)
 
 	// Get existing config or create a new one.
 	// This will respect the existing debug flag, if set.
@@ -381,6 +424,7 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
+	config.SessionCookie = sessionCookie
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -393,6 +437,7 @@ type httpContextFunc func(ctx context.Context, req *http.Request) context.Contex
 // It reads X-Grafana-URL and X-Grafana-API-Key headers, falling back to environment variables if headers are not present.
 var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, req *http.Request) context.Context {
 	u, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req)
+	sessionCookie := sessionCookieFromEnv()
 
 	// Get existing config or create a new one.
 	// This will respect the existing debug flag, if set.
@@ -401,6 +446,7 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
+	config.SessionCookie = sessionCookie
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -520,10 +566,17 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 					if cfg.TLSConfig != nil {
 						timeoutTransport.TLSClientConfig = cfg.TLSConfig
 					}
-					userAgentWrapped := wrapWithUserAgent(timeoutTransport)
+					// Build the transport chain
+					var transport http.RoundTripper = timeoutTransport
+					// Add cookie transport if session cookie is configured
+					if config.SessionCookie != "" {
+						transport = NewCookieRoundTripper(transport, config.SessionCookie)
+						slog.Debug("Session cookie authentication enabled for Grafana client")
+					}
+					userAgentWrapped := wrapWithUserAgent(transport)
 					wrapped := otelhttp.NewTransport(userAgentWrapped)
 					transportField.Set(reflect.ValueOf(wrapped))
-					slog.Debug("HTTP tracing, user agent tracking, and timeout enabled for Grafana client", "timeout", timeout)
+					slog.Debug("HTTP tracing, user agent tracking, and timeout enabled for Grafana client", "timeout", timeout, "session_cookie_set", config.SessionCookie != "")
 				}
 			}
 		}

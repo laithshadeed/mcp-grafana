@@ -289,6 +289,9 @@ func newPyroscopeClient(ctx context.Context, uid string) (*pyroscopeClient, erro
 
 	var transport http.RoundTripper = NewAuthRoundTripper(http.DefaultTransport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
 	transport = mcpgrafana.NewOrgIDRoundTripper(transport, cfg.OrgID)
+	if cfg.SessionCookie != "" {
+		transport = mcpgrafana.NewCookieRoundTripper(transport, cfg.SessionCookie)
+	}
 
 	httpClient := &http.Client{
 		Transport: mcpgrafana.NewUserAgentTransport(

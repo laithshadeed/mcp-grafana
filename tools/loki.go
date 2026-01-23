@@ -81,6 +81,9 @@ func newLokiClient(ctx context.Context, uid string) (*Client, error) {
 
 	transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
 	transport = mcpgrafana.NewOrgIDRoundTripper(transport, cfg.OrgID)
+	if cfg.SessionCookie != "" {
+		transport = mcpgrafana.NewCookieRoundTripper(transport, cfg.SessionCookie)
+	}
 
 	client := &http.Client{
 		Transport: mcpgrafana.NewUserAgentTransport(
