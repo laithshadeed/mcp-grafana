@@ -57,12 +57,9 @@ func newAlertingClientFromContext(ctx context.Context) (*alertingClient, error) 
 	}
 
 	// Create custom transport with TLS configuration if available
-	transport := http.DefaultTransport
-	if tlsConfig := cfg.TLSConfig; tlsConfig != nil {
-		transport, err = tlsConfig.HTTPTransport(http.DefaultTransport.(*http.Transport))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create custom transport: %w", err)
-		}
+	transport, err := mcpgrafana.BuildTransport(&cfg, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create custom transport: %w", err)
 	}
 
 	// Add cookie support for session-based auth
