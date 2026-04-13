@@ -6,9 +6,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"reflect"
@@ -18,11 +20,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-openapi/runtime"
+	openapiclient "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
 	"github.com/grafana/grafana-openapi-client-go/client"
 	"github.com/grafana/incident-go"
 	"github.com/mark3labs/mcp-go/server"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -40,9 +45,11 @@ const (
 	grafanaSessionCookieEnvVar     = "GRAFANA_SESSION_COOKIE"
 	grafanaSessionCookieFileEnvVar = "GRAFANA_SESSION_COOKIE_FILE"
 	grafanaExtraHeadersEnvVar      = "GRAFANA_EXTRA_HEADERS"
+	grafanaForwardHeadersEnvVar    = "GRAFANA_FORWARD_HEADERS"
 
-	grafanaURLHeader    = "X-Grafana-URL"
-	grafanaAPIKeyHeader = "X-Grafana-API-Key"
+	grafanaURLHeader                 = "X-Grafana-URL"
+	grafanaServiceAccountTokenHeader = "X-Grafana-Service-Account-Token"
+	grafanaAPIKeyHeader              = "X-Grafana-API-Key" // Deprecated: use X-Grafana-Service-Account-Token instead
 )
 
 func urlAndAPIKeyFromEnv() (string, string) {
@@ -109,6 +116,67 @@ func extraHeadersFromEnv() map[string]string {
 	return headers
 }
 
+func forwardHeaderNamesFromEnv() []string {
+	raw := os.Getenv(grafanaForwardHeadersEnvVar)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	names := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			names = append(names, p)
+		}
+	}
+	return names
+}
+
+// forwardedHeadersFromRequest reads GRAFANA_FORWARD_HEADERS and copies matching
+// headers from the incoming HTTP request. Returns nil when no headers match.
+func forwardedHeadersFromRequest(req *http.Request) map[string]string {
+	names := forwardHeaderNamesFromEnv()
+	if len(names) == 0 {
+		return nil
+	}
+	var forwarded map[string]string
+	for _, name := range names {
+		if v := req.Header.Get(name); v != "" {
+			if forwarded == nil {
+				forwarded = make(map[string]string, len(names))
+			}
+			forwarded[name] = v
+		}
+	}
+	return forwarded
+}
+
+// mergeHeaders returns a new map containing all entries from base, with entries
+// from override taking precedence. When both maps are non-empty, header names
+// are canonicalized (via textproto.CanonicalMIMEHeaderKey) so that
+// case-insensitive matches are merged correctly and the documented
+// guarantee—incoming request wins—is upheld. When only one side is present the
+// original key casing is preserved.
+func mergeHeaders(base, override map[string]string) map[string]string {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	if len(override) == 0 {
+		return base
+	}
+	if len(base) == 0 {
+		return override
+	}
+	merged := make(map[string]string, len(base)+len(override))
+	for k, v := range base {
+		merged[textproto.CanonicalMIMEHeaderKey(k)] = v
+	}
+	for k, v := range override {
+		merged[textproto.CanonicalMIMEHeaderKey(k)] = v
+	}
+	return merged
+}
+
 func orgIdFromHeaders(req *http.Request) int64 {
 	orgIDStr := req.Header.Get(client.OrgIDHeader)
 	if orgIDStr == "" {
@@ -124,7 +192,15 @@ func orgIdFromHeaders(req *http.Request) int64 {
 
 func urlAndAPIKeyFromHeaders(req *http.Request) (string, string) {
 	u := strings.TrimRight(req.Header.Get(grafanaURLHeader), "/")
-	apiKey := req.Header.Get(grafanaAPIKeyHeader)
+	
+	// Check for the new service account token header first
+	apiKey := req.Header.Get(grafanaServiceAccountTokenHeader)
+	if apiKey != "" {
+		return u, apiKey
+	}
+	
+	// Fall back to the deprecated API key header
+	apiKey = req.Header.Get(grafanaAPIKeyHeader)
 	return u, apiKey
 }
 
@@ -195,6 +271,19 @@ type GrafanaConfig struct {
 	// ExtraHeaders contains additional HTTP headers to send with all Grafana API requests.
 	// Parsed from GRAFANA_EXTRA_HEADERS environment variable as JSON object.
 	ExtraHeaders map[string]string
+
+	// MaxLokiLogLimit is the maximum number of log lines that can be returned
+	// from Loki queries.
+	MaxLokiLogLimit int
+
+	// BaseTransport is an optional base HTTP transport used as the innermost
+	// layer of the middleware chain in NewGrafanaClient. When set, it replaces
+	// the default http.Transport that NewGrafanaClient would otherwise create.
+	// The caller can use this to provide a pre-configured transport with custom
+	// connection pooling, timeouts, or tracing instrumentation.
+	// Note: NewGrafanaClient still wraps this transport with ExtraHeaders,
+	// OrgID, UserAgent, and otelhttp layers.
+	BaseTransport http.RoundTripper
 }
 
 const (
@@ -621,6 +710,7 @@ type httpContextFunc func(ctx context.Context, req *http.Request) context.Contex
 
 // ExtractGrafanaInfoFromHeaders is a HTTPContextFunc that extracts Grafana configuration from HTTP request headers.
 // It reads X-Grafana-URL and X-Grafana-API-Key headers, falling back to environment variables if headers are not present.
+// Headers listed in GRAFANA_FORWARD_HEADERS are copied from the incoming request and merged with GRAFANA_EXTRA_HEADERS.
 var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, req *http.Request) context.Context {
 	u, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req)
 	sessionCookieFile := sessionCookieFileFromEnv()
@@ -639,7 +729,7 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.OrgID = orgID
 	config.SessionCookie = sessionCookie
 	config.SessionCookieFile = sessionCookieFile
-	config.ExtraHeaders = extraHeadersFromEnv()
+	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(), forwardedHeadersFromRequest(req))
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -667,13 +757,143 @@ func MustWithOnBehalfOfAuth(ctx context.Context, accessToken, userToken string) 
 
 type grafanaClientKey struct{}
 
+// GrafanaClient wraps the Grafana HTTP API client with additional metadata
+// fetched from the Grafana instance, such as the public URL.
+// This allows the MCP server to generate user-facing links using the public URL
+// even when it accesses Grafana via an internal URL.
+type GrafanaClient struct {
+	*client.GrafanaHTTPAPI
+
+	// PublicURL is the public-facing URL of the Grafana instance, fetched from
+	// /api/frontend/settings (the appUrl field). It may differ from the configured
+	// URL when the MCP server accesses Grafana via an internal URL behind a load
+	// balancer or reverse proxy.
+	PublicURL string
+}
+
 func makeBasePath(path string) string {
 	return strings.Join([]string{strings.TrimRight(path, "/"), "api"}, "/")
 }
 
+// publicURLCache caches successfully fetched public URLs per Grafana URL.
+// Only non-empty (successful) results are cached; failures are retried on
+// subsequent calls so that transient errors at startup don't permanently
+// disable the feature.
+var publicURLCache sync.Map // map[string]string (grafanaURL -> publicURL)
+
+// publicURLFlight deduplicates concurrent fetchPublicURL calls for the same
+// Grafana URL, preventing thundering-herd HTTP requests and race conditions
+// where a failing goroutine could overwrite a successful result.
+var publicURLFlight singleflight.Group
+
+// fetchPublicURL fetches the public URL (appUrl) from Grafana's frontend settings API.
+// It returns the appUrl if available, or an empty string if the request fails.
+// Successful results are cached permanently; failures are retried on subsequent calls.
+// Concurrent calls for the same grafanaURL are coalesced via singleflight.
+func fetchPublicURL(ctx context.Context, grafanaURL, apiKey string, auth *url.Userinfo, tlsConfig *TLSConfig, extraHeaders map[string]string) string {
+	// Check cache first (only successful results are cached)
+	if cached, ok := publicURLCache.Load(grafanaURL); ok {
+		return cached.(string)
+	}
+
+	// Use singleflight to coalesce concurrent requests for the same URL
+	result, _, _ := publicURLFlight.Do(grafanaURL, func() (any, error) {
+		// Double-check cache inside singleflight (another goroutine may have populated it)
+		if cached, ok := publicURLCache.Load(grafanaURL); ok {
+			return cached.(string), nil
+		}
+
+		// Use a detached context with timeout so that a cancelled request
+		// context from the first caller doesn't fail the fetch for all waiters.
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		publicURL := doFetchPublicURL(fetchCtx, grafanaURL, apiKey, auth, tlsConfig, extraHeaders)
+
+		// Only cache successful (non-empty) results so transient failures are retried
+		if publicURL != "" {
+			publicURLCache.Store(grafanaURL, publicURL)
+		}
+
+		return publicURL, nil
+	})
+
+	return result.(string)
+}
+
+// doFetchPublicURL performs the actual HTTP request to fetch the public URL.
+func doFetchPublicURL(ctx context.Context, grafanaURL, apiKey string, auth *url.Userinfo, tlsConfig *TLSConfig, extraHeaders map[string]string) string {
+	settingsURL := strings.TrimRight(grafanaURL, "/") + "/api/frontend/settings"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, settingsURL, nil)
+	if err != nil {
+		slog.Warn("Failed to create request for frontend settings", "error", err)
+		return ""
+	}
+
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	} else if auth != nil {
+		password, _ := auth.Password()
+		req.SetBasicAuth(auth.Username(), password)
+	}
+	req.Header.Set("User-Agent", UserAgent())
+
+	// Apply extra headers (e.g., for proxies requiring custom headers)
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	if tlsConfig != nil {
+		tlsCfg, err := tlsConfig.CreateTLSConfig()
+		if err != nil {
+			slog.Warn("Failed to create TLS config for frontend settings request", "error", err)
+			return ""
+		}
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: tlsCfg,
+			Proxy:           http.ProxyFromEnvironment,
+		}
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		slog.Warn("Failed to fetch frontend settings", "error", err)
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		slog.Warn("Frontend settings request returned non-OK status", "status", resp.StatusCode)
+		return ""
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Warn("Failed to read frontend settings response", "error", err)
+		return ""
+	}
+
+	var settings struct {
+		AppURL string `json:"appUrl"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		slog.Warn("Failed to parse frontend settings response", "error", err)
+		return ""
+	}
+
+	publicURL := strings.TrimRight(settings.AppURL, "/")
+	if publicURL != "" {
+		slog.Info("Fetched public URL from Grafana frontend settings", "public_url", publicURL)
+	}
+	return publicURL
+}
+
 // NewGrafanaClient creates a Grafana client with the provided URL and API key.
 // The client is automatically configured with the correct HTTP scheme, debug settings from context, custom TLS configuration if present, and OpenTelemetry instrumentation for distributed tracing.
-func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.Userinfo, orgId int64) *client.GrafanaHTTPAPI {
+// It also fetches the Grafana instance's public URL from /api/frontend/settings for use in deep link generation.
+// The org ID is read from the GrafanaConfig in the context, which should be set by ExtractGrafanaInfoFromEnv or ExtractGrafanaInfoFromHeaders before calling this function.
+func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.Userinfo) *GrafanaClient {
 	cfg := client.DefaultTransportConfig()
 
 	var parsedURL *url.URL
@@ -733,6 +953,17 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 	slog.Debug("Creating Grafana client", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", config.BasicAuth != nil, "org_id", cfg.OrgID, "timeout", timeout, "extra_headers_count", len(config.ExtraHeaders))
 	grafanaClient := client.NewHTTPClientWithConfig(strfmt.Default, cfg)
 
+	// Some Grafana versions (v12+) and reverse proxies return JSON responses
+	// with text/plain or text/html content-type headers. The default
+	// TextConsumer cannot deserialize these into typed Go structs. Override
+	// with JSONConsumer so the client can parse the response body correctly.
+	// See: https://github.com/grafana/mcp-grafana/issues/635
+	if rt, ok := grafanaClient.Transport.(*openapiclient.Runtime); ok {
+		jsonConsumer := runtime.JSONConsumer()
+		rt.Consumers[runtime.TextMime] = jsonConsumer
+		rt.Consumers[runtime.HTMLMime] = jsonConsumer
+	}
+
 	// Always enable HTTP tracing for context propagation (no-op when no exporter configured)
 	// Use reflection to wrap the transport without importing the runtime client package
 	v := reflect.ValueOf(grafanaClient.Transport)
@@ -742,26 +973,39 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 			transportField := v.FieldByName("Transport")
 			if transportField.IsValid() && transportField.CanSet() {
 				if _, ok := transportField.Interface().(http.RoundTripper); ok {
-					// Wrap with timeout transport, then user agent, then otel
-					timeoutTransport := &http.Transport{
-						Proxy: http.ProxyFromEnvironment,
-						DialContext: (&net.Dialer{
-							Timeout:   timeout,
-							KeepAlive: 30 * time.Second,
-						}).DialContext,
-						TLSHandshakeTimeout:   timeout,
-						ResponseHeaderTimeout: timeout,
-						ExpectContinueTimeout: 1 * time.Second,
-						ForceAttemptHTTP2:     true,
-						MaxIdleConns:          100,
-						IdleConnTimeout:       90 * time.Second,
+					// Use caller-provided base transport or create a default one.
+					var rt http.RoundTripper
+					if config.BaseTransport != nil {
+						rt = config.BaseTransport
+					} else {
+						timeoutTransport := &http.Transport{
+							Proxy: http.ProxyFromEnvironment,
+							DialContext: (&net.Dialer{
+								Timeout:   timeout,
+								KeepAlive: 30 * time.Second,
+							}).DialContext,
+							TLSHandshakeTimeout:   timeout,
+							ResponseHeaderTimeout: timeout,
+							ExpectContinueTimeout: 1 * time.Second,
+							ForceAttemptHTTP2:     true,
+							MaxIdleConns:          100,
+							IdleConnTimeout:       90 * time.Second,
+						}
+						// Copy TLS config if present
+						if cfg.TLSConfig != nil {
+							timeoutTransport.TLSClientConfig = cfg.TLSConfig
+						}
+						rt = timeoutTransport
 					}
-					// Copy TLS config if present
-					if cfg.TLSConfig != nil {
-						timeoutTransport.TLSClientConfig = cfg.TLSConfig
+					// Apply on-behalf-of auth headers as the innermost header
+					// layer so they take precedence over ExtraHeaders (which
+					// may contain forwarded headers with the same keys).
+					if config.AccessToken != "" && config.IDToken != "" {
+						rt = NewExtraHeadersRoundTripper(rt, map[string]string{
+							"X-Access-Token": config.AccessToken,
+							"X-Grafana-Id":   config.IDToken,
+						})
 					}
-					// Build the transport chain
-					var rt http.RoundTripper = timeoutTransport
 					if len(config.ExtraHeaders) > 0 {
 						rt = NewExtraHeadersRoundTripper(rt, config.ExtraHeaders)
 					}
@@ -773,6 +1017,9 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 						rt = NewCookieRoundTripper(rt, config.SessionCookie)
 						slog.Debug("Static session cookie authentication enabled")
 					}
+					if config.OrgID > 0 {
+						rt = NewOrgIDRoundTripper(rt, config.OrgID)
+					}
 					userAgentWrapped := wrapWithUserAgent(rt)
 					wrapped := otelhttp.NewTransport(userAgentWrapped)
 					transportField.Set(reflect.ValueOf(wrapped))
@@ -782,7 +1029,13 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 		}
 	}
 
-	return grafanaClient
+	// Fetch the public URL from Grafana's frontend settings.
+	publicURL := fetchPublicURL(ctx, grafanaURL, apiKey, auth, config.TLSConfig, config.ExtraHeaders)
+
+	return &GrafanaClient{
+		GrafanaHTTPAPI: grafanaClient,
+		PublicURL:      publicURL,
+	}
 }
 
 // ExtractGrafanaClientFromEnv is a StdioContextFunc that creates and injects a Grafana client into the context.
@@ -795,32 +1048,36 @@ var ExtractGrafanaClientFromEnv server.StdioContextFunc = func(ctx context.Conte
 		grafanaURL = defaultGrafanaURL
 	}
 	auth := userAndPassFromEnv()
-	orgId := orgIdFromEnv()
-	grafanaClient := NewGrafanaClient(ctx, grafanaURL, apiKey, auth, orgId)
+	grafanaClient := NewGrafanaClient(ctx, grafanaURL, apiKey, auth)
 	return WithGrafanaClient(ctx, grafanaClient)
 }
 
 // ExtractGrafanaClientFromHeaders is a HTTPContextFunc that creates and injects a Grafana client into the context.
 // It prioritizes configuration from HTTP headers (X-Grafana-URL, X-Grafana-API-Key) over environment variables for multi-tenant scenarios.
 var ExtractGrafanaClientFromHeaders httpContextFunc = func(ctx context.Context, req *http.Request) context.Context {
+	config := GrafanaConfigFromContext(ctx)
+	if config.OrgID == 0 {
+		slog.Warn("No org ID found in request headers or environment variables, using default org. Set GRAFANA_ORG_ID or pass X-Grafana-Org-Id header to target a specific org.")
+	}
+
 	// Extract transport config from request headers, and set it on the context.
-	u, apiKey, basicAuth, orgId := extractKeyGrafanaInfoFromReq(req)
+	u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req)
 	slog.Debug("Creating Grafana client", "url", u, "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil)
 
-	grafanaClient := NewGrafanaClient(ctx, u, apiKey, basicAuth, orgId)
+	grafanaClient := NewGrafanaClient(ctx, u, apiKey, basicAuth)
 	return WithGrafanaClient(ctx, grafanaClient)
 }
 
 // WithGrafanaClient sets the Grafana client in the context.
 // The client can be retrieved using GrafanaClientFromContext and will be used by all Grafana-related tools in the MCP server.
-func WithGrafanaClient(ctx context.Context, client *client.GrafanaHTTPAPI) context.Context {
-	return context.WithValue(ctx, grafanaClientKey{}, client)
+func WithGrafanaClient(ctx context.Context, c *GrafanaClient) context.Context {
+	return context.WithValue(ctx, grafanaClientKey{}, c)
 }
 
 // GrafanaClientFromContext retrieves the Grafana client from the context.
 // Returns nil if no client has been set, which tools should handle gracefully with appropriate error messages.
-func GrafanaClientFromContext(ctx context.Context) *client.GrafanaHTTPAPI {
-	c, ok := ctx.Value(grafanaClientKey{}).(*client.GrafanaHTTPAPI)
+func GrafanaClientFromContext(ctx context.Context) *GrafanaClient {
+	c, ok := ctx.Value(grafanaClientKey{}).(*GrafanaClient)
 	if !ok {
 		return nil
 	}
@@ -951,26 +1208,39 @@ func ComposedStdioContextFunc(config GrafanaConfig) server.StdioContextFunc {
 
 // ComposedSSEContextFunc returns a SSEContextFunc that comprises all predefined SSEContextFuncs.
 // It sets up the complete context for SSE transport, extracting configuration from HTTP headers with environment variable fallbacks.
-func ComposedSSEContextFunc(config GrafanaConfig) server.SSEContextFunc {
+// If cache is non-nil, clients are cached by credentials to avoid per-request transport allocation.
+func ComposedSSEContextFunc(config GrafanaConfig, cache ...*ClientCache) server.SSEContextFunc {
+	grafanaExtractor, incidentExtractor := clientExtractors(cache)
 	return ComposeSSEContextFuncs(
 		func(ctx context.Context, req *http.Request) context.Context {
 			return WithGrafanaConfig(ctx, config)
 		},
 		ExtractGrafanaInfoFromHeaders,
-		ExtractGrafanaClientFromHeaders,
-		ExtractIncidentClientFromHeaders,
+		grafanaExtractor,
+		incidentExtractor,
 	)
 }
 
 // ComposedHTTPContextFunc returns a HTTPContextFunc that comprises all predefined HTTPContextFuncs.
 // It provides the complete context setup for HTTP transport, including header-based authentication and client configuration.
-func ComposedHTTPContextFunc(config GrafanaConfig) server.HTTPContextFunc {
+// If cache is non-nil, clients are cached by credentials to avoid per-request transport allocation.
+func ComposedHTTPContextFunc(config GrafanaConfig, cache ...*ClientCache) server.HTTPContextFunc {
+	grafanaExtractor, incidentExtractor := clientExtractors(cache)
 	return ComposeHTTPContextFuncs(
 		func(ctx context.Context, req *http.Request) context.Context {
 			return WithGrafanaConfig(ctx, config)
 		},
 		ExtractGrafanaInfoFromHeaders,
-		ExtractGrafanaClientFromHeaders,
-		ExtractIncidentClientFromHeaders,
+		grafanaExtractor,
+		incidentExtractor,
 	)
+}
+
+// clientExtractors returns the appropriate client extraction functions,
+// using cached versions if a cache is provided.
+func clientExtractors(cache []*ClientCache) (httpContextFunc, httpContextFunc) {
+	if len(cache) > 0 && cache[0] != nil {
+		return extractGrafanaClientCached(cache[0]), extractIncidentClientCached(cache[0])
+	}
+	return ExtractGrafanaClientFromHeaders, ExtractIncidentClientFromHeaders
 }
