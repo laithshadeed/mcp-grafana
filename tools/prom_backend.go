@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -76,6 +77,17 @@ func newPrometheusBackend(ctx context.Context, uid string, ds *models.DataSource
 	rt = NewAuthRoundTripper(rt, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
 	rt = mcpgrafana.NewOrgIDRoundTripper(rt, cfg.OrgID)
 
+	// Add session cookie transport for cookie-based authentication
+	if cfg.SessionCookieFile != "" {
+		slog.Info("Prometheus backend: using dynamic session cookie", "file", cfg.SessionCookieFile)
+		rt = mcpgrafana.NewDynamicCookieRoundTripper(rt, cfg.SessionCookieFile)
+	} else if cfg.SessionCookie != "" {
+		slog.Info("Prometheus backend: using static session cookie")
+		rt = mcpgrafana.NewCookieRoundTripper(rt, cfg.SessionCookie)
+	} else {
+		slog.Warn("Prometheus backend: NO session cookie configured", "url", grafanaURL)
+	}
+
 	// Only convert POST→GET if the datasource is configured to use GET.
 	// The Prometheus client library sends POST first and only falls back to GET
 	// on 405/501 responses, but Grafana's datasource proxy returns 500 for POST
@@ -86,6 +98,9 @@ func newPrometheusBackend(ctx context.Context, uid string, ds *models.DataSource
 			rt = &postToGetRoundTripper{underlying: rt}
 		}
 	}
+
+	// Add user agent transport (matching Loki's pattern)
+	rt = mcpgrafana.NewUserAgentTransport(rt)
 
 	// Wrap with fallback transport: try /resources first, fall back to /proxy
 	// on 403/500 for compatibility with different managed Grafana deployments.

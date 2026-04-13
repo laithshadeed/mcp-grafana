@@ -234,6 +234,14 @@ func createHTTPClient(config mcpgrafana.GrafanaConfig) (*http.Client, error) {
 		return nil, err
 	}
 	transport = mcpgrafana.NewOrgIDRoundTripper(transport, config.OrgID)
+
+	// Add session cookie transport for cookie-based authentication
+	if config.SessionCookieFile != "" {
+		transport = mcpgrafana.NewDynamicCookieRoundTripper(transport, config.SessionCookieFile)
+	} else if config.SessionCookie != "" {
+		transport = mcpgrafana.NewCookieRoundTripper(transport, config.SessionCookie)
+	}
+
 	transport = mcpgrafana.NewUserAgentTransport(transport)
 
 	return &http.Client{Transport: transport}, nil

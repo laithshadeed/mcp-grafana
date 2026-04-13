@@ -575,9 +575,16 @@ func (t *DynamicCookieRoundTripper) RoundTrip(req *http.Request) (*http.Response
 			Name:  "grafana_session",
 			Value: cookie,
 		})
+		slog.Info("DynamicCookieRoundTripper: attached cookie", "url", req.URL.String(), "cookie_prefix", cookie[:min(8, len(cookie))])
+	} else {
+		slog.Warn("DynamicCookieRoundTripper: no cookie to attach", "url", req.URL.String())
 	}
 
-	return t.underlying.RoundTrip(clonedReq)
+	resp, err := t.underlying.RoundTrip(clonedReq)
+	if resp != nil {
+		slog.Info("DynamicCookieRoundTripper: response", "url", req.URL.String(), "status", resp.StatusCode)
+	}
+	return resp, err
 }
 
 type ExtraHeadersRoundTripper struct {

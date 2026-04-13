@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -79,9 +80,13 @@ func newLokiClient(ctx context.Context, uid string) (*Client, error) {
 	transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
 	transport = mcpgrafana.NewOrgIDRoundTripper(transport, cfg.OrgID)
 	if cfg.SessionCookieFile != "" {
+		slog.Info("Loki client: using dynamic session cookie", "file", cfg.SessionCookieFile)
 		transport = mcpgrafana.NewDynamicCookieRoundTripper(transport, cfg.SessionCookieFile)
 	} else if cfg.SessionCookie != "" {
+		slog.Info("Loki client: using static session cookie")
 		transport = mcpgrafana.NewCookieRoundTripper(transport, cfg.SessionCookie)
+	} else {
+		slog.Warn("Loki client: NO session cookie configured")
 	}
 
 	// Wrap with fallback transport: try /proxy first, fall back to /resources
