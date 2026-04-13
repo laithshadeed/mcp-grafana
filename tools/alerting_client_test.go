@@ -6,9 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	mcpgrafana "github.com/grafana/mcp-grafana"
@@ -114,4 +117,70 @@ func TestNewAlertingClientFromContext(t *testing.T) {
 	require.Equal(t, "http://localhost:3000", client.baseURL.String())
 	require.Equal(t, "test-api-key", client.apiKey)
 	require.NotNil(t, client.httpClient)
+}
+
+func TestNewAlertingClientFromContext_SessionCookieFile(t *testing.T) {
+	cookieFile := filepath.Join(t.TempDir(), "cookie.txt")
+	require.NoError(t, os.WriteFile(cookieFile, []byte("tok123"), 0600))
+
+	var capturedCookie string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, c := range r.Cookies() {
+			if c.Name == "grafana_session" {
+				capturedCookie = c.Value
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(rulesResponse{})
+	}))
+	defer server.Close()
+
+	config := mcpgrafana.GrafanaConfig{
+		URL:               server.URL,
+		SessionCookieFile: cookieFile,
+	}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
+
+	c, err := newAlertingClientFromContext(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+
+	_, err = c.GetRules(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, "tok123", capturedCookie, "expected cookie from file to be sent in request")
+}
+
+func TestNewAlertingClientFromContext_SessionCookieFilePrecedence(t *testing.T) {
+	cookieFile := filepath.Join(t.TempDir(), "cookie.txt")
+	require.NoError(t, os.WriteFile(cookieFile, []byte("file-cookie"), 0600))
+
+	var capturedCookie string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, c := range r.Cookies() {
+			if c.Name == "grafana_session" {
+				capturedCookie = c.Value
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(rulesResponse{})
+	}))
+	defer server.Close()
+
+	config := mcpgrafana.GrafanaConfig{
+		URL:               server.URL,
+		SessionCookieFile: cookieFile,
+		SessionCookie:     "static-cookie",
+	}
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), config)
+
+	c, err := newAlertingClientFromContext(ctx)
+	require.NoError(t, err)
+
+	_, err = c.GetRules(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, "file-cookie", capturedCookie, "file-based cookie should take precedence over static cookie")
 }

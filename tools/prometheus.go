@@ -67,7 +67,9 @@ func promClientFromContext(ctx context.Context, uid string) (promv1.API, error) 
 
 	// Wrap with org ID support
 	rt = mcpgrafana.NewOrgIDRoundTripper(rt, cfg.OrgID)
-	if cfg.SessionCookie != "" {
+	if cfg.SessionCookieFile != "" {
+		rt = mcpgrafana.NewDynamicCookieRoundTripper(rt, cfg.SessionCookieFile)
+	} else if cfg.SessionCookie != "" {
 		rt = mcpgrafana.NewCookieRoundTripper(rt, cfg.SessionCookie)
 	}
 

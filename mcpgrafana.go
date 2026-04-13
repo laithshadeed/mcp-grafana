@@ -37,9 +37,9 @@ const (
 	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
 	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
 
-	grafanaSessionCookieEnvVar = "GRAFANA_SESSION_COOKIE"
-	grafanaExtraHeadersEnvVar  = "GRAFANA_EXTRA_HEADERS"
-
+	grafanaSessionCookieEnvVar     = "GRAFANA_SESSION_COOKIE"
+	grafanaSessionCookieFileEnvVar = "GRAFANA_SESSION_COOKIE_FILE"
+	grafanaExtraHeadersEnvVar      = "GRAFANA_EXTRA_HEADERS"
 
 	grafanaURLHeader    = "X-Grafana-URL"
 	grafanaAPIKeyHeader = "X-Grafana-API-Key"
@@ -77,6 +77,10 @@ func userAndPassFromEnv() *url.Userinfo {
 
 func sessionCookieFromEnv() string {
 	return os.Getenv(grafanaSessionCookieEnvVar)
+}
+
+func sessionCookieFileFromEnv() string {
+	return os.Getenv(grafanaSessionCookieFileEnvVar)
 }
 
 func orgIdFromEnv() int64 {
@@ -182,6 +186,11 @@ type GrafanaConfig struct {
 	// SessionCookie is the grafana_session cookie value for cookie-based authentication.
 	// This is useful when using SSO (like Okta) where service account tokens are not available.
 	SessionCookie string
+
+	// SessionCookieFile is the path to a file containing the session cookie.
+	// The cookie is reloaded when the file changes, enabling refresh without restart.
+	// If set, this takes precedence over SessionCookie.
+	SessionCookieFile string
 
 	// ExtraHeaders contains additional HTTP headers to send with all Grafana API requests.
 	// Parsed from GRAFANA_EXTRA_HEADERS environment variable as JSON object.
@@ -382,6 +391,106 @@ func NewCookieRoundTripper(rt http.RoundTripper, sessionCookie string) *CookieRo
 	}
 }
 
+// DynamicCookieRoundTripper reads the session cookie from a file on each request,
+// reloading when the file changes. This enables cookie refresh without server restart.
+type DynamicCookieRoundTripper struct {
+	underlying   http.RoundTripper
+	cookieFile   string
+	cachedCookie string
+	lastModTime  time.Time
+	mutex        sync.RWMutex
+}
+
+// NewDynamicCookieRoundTripper creates a new DynamicCookieRoundTripper that reads
+// the session cookie from the specified file, reloading automatically when the file changes.
+func NewDynamicCookieRoundTripper(rt http.RoundTripper, cookieFile string) *DynamicCookieRoundTripper {
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	d := &DynamicCookieRoundTripper{
+		underlying: rt,
+		cookieFile: cookieFile,
+	}
+	// Initial load
+	d.reloadCookie()
+	return d
+}
+
+// sessionFileFormat represents the JSON format of the session cookie file.
+type sessionFileFormat struct {
+	Cookie string `json:"cookie"`
+}
+
+func (t *DynamicCookieRoundTripper) reloadCookie() {
+	info, err := os.Stat(t.cookieFile)
+	if err != nil {
+		slog.Debug("Failed to stat cookie file", "file", t.cookieFile, "error", err)
+		return
+	}
+
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	if info.ModTime().After(t.lastModTime) {
+		data, err := os.ReadFile(t.cookieFile)
+		if err != nil {
+			slog.Error("Failed to read cookie file", "file", t.cookieFile, "error", err)
+			return
+		}
+
+		content := strings.TrimSpace(string(data))
+		cookie := content
+
+		// Try to parse as JSON (supports format: {"cookie": "grafana_session=xxx"})
+		if strings.HasPrefix(content, "{") {
+			var sessionFile sessionFileFormat
+			if err := json.Unmarshal(data, &sessionFile); err == nil && sessionFile.Cookie != "" {
+				// Extract the value after "grafana_session=" if present
+				cookie = sessionFile.Cookie
+				if strings.HasPrefix(cookie, "grafana_session=") {
+					cookie = strings.TrimPrefix(cookie, "grafana_session=")
+				}
+			}
+		}
+
+		t.cachedCookie = cookie
+		t.lastModTime = info.ModTime()
+		slog.Info("Reloaded session cookie from file", "file", t.cookieFile)
+	}
+}
+
+func (t *DynamicCookieRoundTripper) getCookie() string {
+	// Check if file changed (quick stat check)
+	info, err := os.Stat(t.cookieFile)
+	if err == nil {
+		t.mutex.RLock()
+		needsReload := info.ModTime().After(t.lastModTime)
+		t.mutex.RUnlock()
+
+		if needsReload {
+			t.reloadCookie()
+		}
+	}
+
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.cachedCookie
+}
+
+func (t *DynamicCookieRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	clonedReq := req.Clone(req.Context())
+
+	cookie := t.getCookie()
+	if cookie != "" {
+		clonedReq.AddCookie(&http.Cookie{
+			Name:  "grafana_session",
+			Value: cookie,
+		})
+	}
+
+	return t.underlying.RoundTrip(clonedReq)
+}
+
 type ExtraHeadersRoundTripper struct {
 	underlying http.RoundTripper
 	headers    map[string]string
@@ -483,9 +592,14 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 		panic(fmt.Errorf("invalid Grafana URL %s: %w", u, err))
 	}
 
-	sessionCookie := sessionCookieFromEnv()
+	sessionCookieFile := sessionCookieFileFromEnv()
+	sessionCookie := ""
+	// Only read from env var if file is not specified
+	if sessionCookieFile == "" {
+		sessionCookie = sessionCookieFromEnv()
+	}
 	extraHeaders := extraHeadersFromEnv()
-	slog.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "session_cookie_set", sessionCookie != "", "org_id", orgID, "extra_headers_count", len(extraHeaders))
+	slog.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "session_cookie_set", sessionCookie != "", "session_cookie_file", sessionCookieFile, "org_id", orgID, "extra_headers_count", len(extraHeaders))
 
 	// Get existing config or create a new one.
 	// This will respect the existing debug flag, if set.
@@ -495,6 +609,7 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.SessionCookie = sessionCookie
+	config.SessionCookieFile = sessionCookieFile
 	config.ExtraHeaders = extraHeaders
 	return WithGrafanaConfig(ctx, config)
 }
@@ -508,7 +623,12 @@ type httpContextFunc func(ctx context.Context, req *http.Request) context.Contex
 // It reads X-Grafana-URL and X-Grafana-API-Key headers, falling back to environment variables if headers are not present.
 var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, req *http.Request) context.Context {
 	u, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req)
-	sessionCookie := sessionCookieFromEnv()
+	sessionCookieFile := sessionCookieFileFromEnv()
+	sessionCookie := ""
+	// Only read from env var if file is not specified
+	if sessionCookieFile == "" {
+		sessionCookie = sessionCookieFromEnv()
+	}
 
 	// Get existing config or create a new one.
 	// This will respect the existing debug flag, if set.
@@ -518,6 +638,7 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.SessionCookie = sessionCookie
+	config.SessionCookieFile = sessionCookieFile
 	config.ExtraHeaders = extraHeadersFromEnv()
 	return WithGrafanaConfig(ctx, config)
 }
@@ -644,15 +765,18 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 					if len(config.ExtraHeaders) > 0 {
 						rt = NewExtraHeadersRoundTripper(rt, config.ExtraHeaders)
 					}
-					// Add cookie transport if session cookie is configured
-					if config.SessionCookie != "" {
+					// Add cookie transport - prefer file-based for dynamic reload
+					if config.SessionCookieFile != "" {
+						rt = NewDynamicCookieRoundTripper(rt, config.SessionCookieFile)
+						slog.Debug("Dynamic session cookie authentication enabled", "file", config.SessionCookieFile)
+					} else if config.SessionCookie != "" {
 						rt = NewCookieRoundTripper(rt, config.SessionCookie)
-						slog.Debug("Session cookie authentication enabled for Grafana client")
+						slog.Debug("Static session cookie authentication enabled")
 					}
 					userAgentWrapped := wrapWithUserAgent(rt)
 					wrapped := otelhttp.NewTransport(userAgentWrapped)
 					transportField.Set(reflect.ValueOf(wrapped))
-					slog.Debug("HTTP tracing, user agent tracking, and timeout enabled for Grafana client", "timeout", timeout, "session_cookie_set", config.SessionCookie != "")
+					slog.Debug("HTTP tracing, user agent tracking, and timeout enabled for Grafana client", "timeout", timeout, "session_cookie_set", config.SessionCookie != "", "session_cookie_file", config.SessionCookieFile)
 				}
 			}
 		}

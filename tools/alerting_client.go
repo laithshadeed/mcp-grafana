@@ -63,7 +63,9 @@ func newAlertingClientFromContext(ctx context.Context) (*alertingClient, error) 
 	}
 
 	// Add cookie support for session-based auth
-	if cfg.SessionCookie != "" {
+	if cfg.SessionCookieFile != "" {
+		transport = mcpgrafana.NewDynamicCookieRoundTripper(transport, cfg.SessionCookieFile)
+	} else if cfg.SessionCookie != "" {
 		transport = mcpgrafana.NewCookieRoundTripper(transport, cfg.SessionCookie)
 	}
 

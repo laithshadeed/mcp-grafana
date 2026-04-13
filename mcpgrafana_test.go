@@ -4,9 +4,14 @@
 package mcpgrafana
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go-openapi/runtime/client"
 	grafana_client "github.com/grafana/grafana-openapi-client-go/client"
@@ -818,5 +823,188 @@ func TestExtractGrafanaInfoWithExtraHeaders(t *testing.T) {
 		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
 		config := GrafanaConfigFromContext(ctx)
 		assert.Equal(t, map[string]string{"X-Tenant-ID": "tenant-456"}, config.ExtraHeaders)
+	})
+}
+
+func newMockRTFn(fn func(*http.Request) (*http.Response, error)) http.RoundTripper {
+	return &extraHeadersMockRT{fn: fn}
+}
+
+func okResponse() *http.Response {
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(nil))}
+}
+
+func TestDynamicCookieRoundTripper(t *testing.T) {
+	t.Run("plain text file", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "cookie.txt")
+		require.NoError(t, os.WriteFile(cookieFile, []byte("abc123"), 0600))
+
+		var captured *http.Request
+		rt := NewDynamicCookieRoundTripper(newMockRTFn(func(req *http.Request) (*http.Response, error) {
+			captured = req
+			return okResponse(), nil
+		}), cookieFile)
+
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		cookies := captured.Cookies()
+		require.Len(t, cookies, 1)
+		assert.Equal(t, "grafana_session", cookies[0].Name)
+		assert.Equal(t, "abc123", cookies[0].Value)
+	})
+
+	t.Run("JSON format with grafana_session prefix stripped", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "cookie.json")
+		require.NoError(t, os.WriteFile(cookieFile, []byte(`{"cookie":"grafana_session=tok123"}`), 0600))
+
+		var captured *http.Request
+		rt := NewDynamicCookieRoundTripper(newMockRTFn(func(req *http.Request) (*http.Response, error) {
+			captured = req
+			return okResponse(), nil
+		}), cookieFile)
+
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		cookies := captured.Cookies()
+		require.Len(t, cookies, 1)
+		assert.Equal(t, "tok123", cookies[0].Value)
+	})
+
+	t.Run("JSON format without grafana_session prefix", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "cookie.json")
+		require.NoError(t, os.WriteFile(cookieFile, []byte(`{"cookie":"rawtoken"}`), 0600))
+
+		var captured *http.Request
+		rt := NewDynamicCookieRoundTripper(newMockRTFn(func(req *http.Request) (*http.Response, error) {
+			captured = req
+			return okResponse(), nil
+		}), cookieFile)
+
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		cookies := captured.Cookies()
+		require.Len(t, cookies, 1)
+		assert.Equal(t, "rawtoken", cookies[0].Value)
+	})
+
+	t.Run("missing file does not add cookie", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "nonexistent.txt")
+
+		var captured *http.Request
+		rt := NewDynamicCookieRoundTripper(newMockRTFn(func(req *http.Request) (*http.Response, error) {
+			captured = req
+			return okResponse(), nil
+		}), cookieFile)
+
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		assert.Empty(t, captured.Cookies())
+	})
+
+	t.Run("empty file does not add cookie", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "empty.txt")
+		require.NoError(t, os.WriteFile(cookieFile, []byte(""), 0600))
+
+		var captured *http.Request
+		rt := NewDynamicCookieRoundTripper(newMockRTFn(func(req *http.Request) (*http.Response, error) {
+			captured = req
+			return okResponse(), nil
+		}), cookieFile)
+
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		assert.Empty(t, captured.Cookies())
+	})
+
+	t.Run("file reloaded on mtime change", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "cookie.txt")
+		require.NoError(t, os.WriteFile(cookieFile, []byte("first-cookie"), 0600))
+
+		var captured *http.Request
+		rt := NewDynamicCookieRoundTripper(newMockRTFn(func(req *http.Request) (*http.Response, error) {
+			captured = req
+			return okResponse(), nil
+		}), cookieFile)
+
+		// First request: should use first-cookie
+		req1, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err := rt.RoundTrip(req1)
+		require.NoError(t, err)
+		require.Len(t, captured.Cookies(), 1)
+		assert.Equal(t, "first-cookie", captured.Cookies()[0].Value)
+
+		// Overwrite file with new content and advance mtime so reload is triggered
+		require.NoError(t, os.WriteFile(cookieFile, []byte("second-cookie"), 0600))
+		future := time.Now().Add(2 * time.Second)
+		require.NoError(t, os.Chtimes(cookieFile, future, future))
+
+		// Second request: should pick up second-cookie
+		req2, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err = rt.RoundTrip(req2)
+		require.NoError(t, err)
+		require.Len(t, captured.Cookies(), 1)
+		assert.Equal(t, "second-cookie", captured.Cookies()[0].Value)
+	})
+
+	t.Run("nil transport uses http.DefaultTransport", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "cookie.txt")
+		require.NoError(t, os.WriteFile(cookieFile, []byte("tok"), 0600))
+
+		rt := NewDynamicCookieRoundTripper(nil, cookieFile)
+		require.NotNil(t, rt)
+		assert.Equal(t, http.DefaultTransport, rt.underlying)
+	})
+
+	t.Run("original request not mutated", func(t *testing.T) {
+		cookieFile := filepath.Join(t.TempDir(), "cookie.txt")
+		require.NoError(t, os.WriteFile(cookieFile, []byte("mytok"), 0600))
+
+		rt := NewDynamicCookieRoundTripper(newMockRTFn(func(req *http.Request) (*http.Response, error) {
+			return okResponse(), nil
+		}), cookieFile)
+
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		before := len(req.Cookies())
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+		assert.Equal(t, before, len(req.Cookies()))
+	})
+}
+
+func TestSessionCookieFileFromEnv(t *testing.T) {
+	t.Run("env set", func(t *testing.T) {
+		t.Setenv(grafanaSessionCookieFileEnvVar, "/tmp/cookie.txt")
+		assert.Equal(t, "/tmp/cookie.txt", sessionCookieFileFromEnv())
+	})
+
+	t.Run("env unset", func(t *testing.T) {
+		t.Setenv(grafanaSessionCookieFileEnvVar, "")
+		assert.Equal(t, "", sessionCookieFileFromEnv())
+	})
+}
+
+func TestExtractGrafanaInfoFromEnv_SessionCookieFile(t *testing.T) {
+	t.Run("session cookie file propagated to config", func(t *testing.T) {
+		t.Setenv("GRAFANA_SESSION_COOKIE_FILE", "/tmp/session.txt")
+		ctx := ExtractGrafanaInfoFromEnv(context.Background())
+		config := GrafanaConfigFromContext(ctx)
+		assert.Equal(t, "/tmp/session.txt", config.SessionCookieFile)
+	})
+
+	t.Run("unset session cookie file gives empty string", func(t *testing.T) {
+		t.Setenv("GRAFANA_SESSION_COOKIE_FILE", "")
+		ctx := ExtractGrafanaInfoFromEnv(context.Background())
+		config := GrafanaConfigFromContext(ctx)
+		assert.Equal(t, "", config.SessionCookieFile)
 	})
 }

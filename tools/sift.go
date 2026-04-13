@@ -117,7 +117,9 @@ func newSiftClient(cfg mcpgrafana.GrafanaConfig) (*siftClient, error) {
 	}
 	transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
 	transport = mcpgrafana.NewOrgIDRoundTripper(transport, cfg.OrgID)
-	if cfg.SessionCookie != "" {
+	if cfg.SessionCookieFile != "" {
+		transport = mcpgrafana.NewDynamicCookieRoundTripper(transport, cfg.SessionCookieFile)
+	} else if cfg.SessionCookie != "" {
 		transport = mcpgrafana.NewCookieRoundTripper(transport, cfg.SessionCookie)
 	}
 	transport = mcpgrafana.NewUserAgentTransport(transport)

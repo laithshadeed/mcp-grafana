@@ -1,0 +1,5 @@
+# macOS/Podman override: Promtail needs privileged mode to access the Docker
+# socket via Podman's rootless user-namespace setup.
+services:
+  promtail:
+    privileged: true
