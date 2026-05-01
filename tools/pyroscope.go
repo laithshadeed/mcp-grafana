@@ -212,7 +212,6 @@ func listPyroscopeProfileTypes(ctx context.Context, args ListPyroscopeProfileTyp
 	return profileTypes, nil
 }
 
-
 func newPyroscopeClient(ctx context.Context, uid string) (*pyroscopeClient, error) {
 	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
 
@@ -220,19 +219,10 @@ func newPyroscopeClient(ctx context.Context, uid string) (*pyroscopeClient, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to create custom transport: %w", err)
 	}
-	transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
-	transport = mcpgrafana.NewOrgIDRoundTripper(transport, cfg.OrgID)
-	if cfg.SessionCookieFile != "" {
-		transport = mcpgrafana.NewDynamicCookieRoundTripper(transport, cfg.SessionCookieFile)
-	} else if cfg.SessionCookie != "" {
-		transport = mcpgrafana.NewCookieRoundTripper(transport, cfg.SessionCookie)
-	}
 
 	httpClient := &http.Client{
-		Transport: mcpgrafana.NewUserAgentTransport(
-			transport,
-		),
-		Timeout: 10 * time.Second,
+		Transport: transport,
+		Timeout:   10 * time.Second,
 	}
 
 	_, err = getDatasourceByUID(ctx, GetDatasourceByUIDParams{UID: uid})
@@ -392,7 +382,6 @@ func cleanupDotProfile(profile string) string {
 		return ""
 	})
 }
-
 
 var matchersRegex = regexp.MustCompile(`^\{.*\}$`)
 

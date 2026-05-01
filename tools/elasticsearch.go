@@ -73,27 +73,15 @@ func newElasticsearchClient(ctx context.Context, uid string) (*ElasticsearchClie
 	}
 
 	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
-	url := fmt.Sprintf("%s/api/datasources/proxy/uid/%s", strings.TrimRight(cfg.URL, "/"), uid)
+	url := fmt.Sprintf("%s/api/datasources/proxy/uid/%s", cfg.URL, uid)
 
-	// Create custom transport with TLS configuration and extra headers
 	transport, err := mcpgrafana.BuildTransport(&cfg, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create custom transport: %w", err)
 	}
-	transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
-	transport = mcpgrafana.NewOrgIDRoundTripper(transport, cfg.OrgID)
-
-	// Add session cookie transport for cookie-based authentication
-	if cfg.SessionCookieFile != "" {
-		transport = mcpgrafana.NewDynamicCookieRoundTripper(transport, cfg.SessionCookieFile)
-	} else if cfg.SessionCookie != "" {
-		transport = mcpgrafana.NewCookieRoundTripper(transport, cfg.SessionCookie)
-	}
 
 	client := &http.Client{
-		Transport: mcpgrafana.NewUserAgentTransport(
-			transport,
-		),
+		Transport: transport,
 	}
 
 	return &ElasticsearchClient{

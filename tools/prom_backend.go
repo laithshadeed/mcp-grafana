@@ -1,10 +1,11 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,6 +51,8 @@ func backendForDatasource(ctx context.Context, uid string, projectOverride ...st
 	switch ds.Type {
 	case "stackdriver":
 		return newCloudMonitoringBackend(ctx, ds, proj)
+	case victoriaMetricsDatasourceType:
+		return newVictoriaMetricsBackend(ctx, uid, ds)
 	default:
 		// For prometheus, thanos, cortex, mimir, and any other Prometheus-compatible datasource,
 		// use the native Prometheus client via the datasource proxy.
@@ -74,20 +77,6 @@ func newPrometheusBackend(ctx context.Context, uid string, ds *models.DataSource
 		return nil, fmt.Errorf("failed to create custom transport: %w", err)
 	}
 
-	rt = NewAuthRoundTripper(rt, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
-	rt = mcpgrafana.NewOrgIDRoundTripper(rt, cfg.OrgID)
-
-	// Add session cookie transport for cookie-based authentication
-	if cfg.SessionCookieFile != "" {
-		slog.Info("Prometheus backend: using dynamic session cookie", "file", cfg.SessionCookieFile)
-		rt = mcpgrafana.NewDynamicCookieRoundTripper(rt, cfg.SessionCookieFile)
-	} else if cfg.SessionCookie != "" {
-		slog.Info("Prometheus backend: using static session cookie")
-		rt = mcpgrafana.NewCookieRoundTripper(rt, cfg.SessionCookie)
-	} else {
-		slog.Warn("Prometheus backend: NO session cookie configured", "url", grafanaURL)
-	}
-
 	// Only convert POST→GET if the datasource is configured to use GET.
 	// The Prometheus client library sends POST first and only falls back to GET
 	// on 405/501 responses, but Grafana's datasource proxy returns 500 for POST
@@ -98,9 +87,6 @@ func newPrometheusBackend(ctx context.Context, uid string, ds *models.DataSource
 			rt = &postToGetRoundTripper{underlying: rt}
 		}
 	}
-
-	// Add user agent transport (matching Loki's pattern)
-	rt = mcpgrafana.NewUserAgentTransport(rt)
 
 	// Wrap with fallback transport: try /resources first, fall back to /proxy
 	// on 403/500 for compatibility with different managed Grafana deployments.
@@ -213,6 +199,44 @@ func (rt *postToGetRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 	}
 
 	return rt.underlying.RoundTrip(cloned)
+}
+
+// doDSQuery posts payload to Grafana's /api/ds/query endpoint and decodes the
+// response. Shared by backends that route queries through the datasource query
+// API instead of a datasource-specific client.
+func doDSQuery(ctx context.Context, client *http.Client, baseURL string, payload map[string]interface{}) (*dsQueryResponse, error) {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling query payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/ds/query", bytes.NewReader(payloadBytes))
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("query returned status %d: %s", resp.StatusCode, string(body[:min(len(body), 1024)]))
+	}
+
+	var queryResp dsQueryResponse
+	if err := json.Unmarshal(body, &queryResp); err != nil {
+		return nil, fmt.Errorf("unmarshaling response: %w", err)
+	}
+
+	return &queryResp, nil
 }
 
 func trimTrailingSlash(s string) string {

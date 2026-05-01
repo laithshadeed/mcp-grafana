@@ -45,10 +45,11 @@ var (
 func setupMockServer(handler http.HandlerFunc) (*httptest.Server, *alertingClient) {
 	server := httptest.NewServer(handler)
 	baseURL, _ := url.Parse(server.URL)
+	cfg := mcpgrafana.GrafanaConfig{APIKey: "test-api-key"}
+	transport, _ := mcpgrafana.BuildTransport(&cfg, nil)
 	client := &alertingClient{
 		baseURL:    baseURL,
-		apiKey:     "test-api-key",
-		httpClient: &http.Client{},
+		httpClient: &http.Client{Transport: transport},
 	}
 	return server, client
 }
@@ -431,8 +432,8 @@ func TestNewAlertingClientFromContext(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, "http://localhost:3000", client.baseURL.String())
-	require.Equal(t, "test-api-key", client.apiKey)
 	require.NotNil(t, client.httpClient)
+	require.NotNil(t, client.httpClient.Transport)
 }
 
 func TestNewAlertingClientFromContext_SessionCookieFile(t *testing.T) {
