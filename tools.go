@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"strings"
@@ -49,8 +50,48 @@ func (e *HardError) Unwrap() error {
 // allowing fluent tool registration in a single statement:
 //
 //	mcpgrafana.MustTool(name, description, toolHandler).Register(server)
+//
+// When multi-instance mode is active (a populated GlobalInstanceStore), an
+// "endpoint" parameter is injected into the tool's input schema here — at
+// registration time, not at ConvertTool time — because most tools are built
+// via package-level vars (e.g. `var ListDatasources = mcpgrafana.MustTool(…)`)
+// that initialize before main() calls InitInstanceStore. Doing it here lets
+// the store be populated first, then every tool gets the endpoint enum when
+// it actually registers with the server.
 func (t *Tool) Register(mcp *server.MCPServer) {
+	if store := GlobalInstanceStore(); store != nil && store.HasInstances() {
+		if injected, err := injectEndpointIntoSchema(t.Tool.RawInputSchema, store.InstanceNames()); err != nil {
+			slog.Warn("failed to inject endpoint into tool schema",
+				"tool", t.Tool.Name, "error", err)
+		} else {
+			t.Tool.RawInputSchema = injected
+		}
+	}
 	mcp.AddTool(t.Tool, t.Handler)
+}
+
+// injectEndpointIntoSchema parses a tool's RawInputSchema, adds an "endpoint"
+// property whose enum is the list of configured instance names, and returns
+// the re-marshalled bytes. Idempotent: calling it twice leaves the same key.
+func injectEndpointIntoSchema(raw []byte, instanceNames []string) ([]byte, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return nil, fmt.Errorf("unmarshal schema: %w", err)
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if props == nil {
+		props = make(map[string]any)
+		schema["properties"] = props
+	}
+	props["endpoint"] = map[string]any{
+		"type":        "string",
+		"description": "Name of the Grafana instance to use. Call list_endpoints to see available instances.",
+		"enum":        instanceNames,
+	}
+	return json.Marshal(schema)
 }
 
 // MustTool creates a new Tool from the given name, description, and toolHandler.
@@ -242,6 +283,36 @@ func ConvertTool[T any, R any](name, description string, toolHandler ToolHandler
 			span.SetAttributes(semconv.McpSessionID(session.SessionID()))
 		}
 
+		// Resolve multi-instance endpoint parameter. When a global
+		// InstanceStore is configured, extract the "endpoint" key from the
+		// raw arguments, look up the matching instance, and override the
+		// Grafana client (and config URL) in the context so that downstream
+		// tool handlers transparently talk to the correct instance.
+		if store := GlobalInstanceStore(); store != nil && store.HasInstances() {
+			if raw, ok := request.Params.Arguments.(map[string]any); ok && raw != nil {
+				if ep, ok := raw["endpoint"]; ok {
+					if epStr, ok := ep.(string); ok && epStr != "" {
+						client, err := store.GetClient(ctx, epStr)
+						if err != nil {
+							span.RecordError(err)
+							span.SetStatus(codes.Error, err.Error())
+							return nil, err
+						}
+						ctx = WithGrafanaClient(ctx, client)
+						instCfg := store.InstanceConfigByName(epStr)
+						if instCfg != nil {
+							cfg := GrafanaConfigFromContext(ctx)
+							cfg.URL = instCfg.URL
+							cfg.APIKey = instCfg.ServiceAccountToken
+							ctx = WithGrafanaConfig(ctx, cfg)
+						}
+						span.SetAttributes(attribute.String("mcp.endpoint", epStr))
+					}
+					delete(raw, "endpoint")
+				}
+			}
+		}
+
 		argBytes, err := json.Marshal(request.Params.Arguments)
 		if err != nil {
 			span.RecordError(err)
@@ -384,6 +455,15 @@ func ConvertTool[T any, R any](name, description string, toolHandler ToolHandler
 		Type:       jsonSchema.Type,
 		Properties: properties,
 		Required:   jsonSchema.Required,
+	}
+
+	// Inject "endpoint" parameter into every tool's schema when multi-instance mode is active.
+	if store := GlobalInstanceStore(); store != nil && store.HasInstances() {
+		properties["endpoint"] = map[string]any{
+			"type":        "string",
+			"description": "Name of the Grafana instance to use. Call list_endpoints to see available instances.",
+			"enum":        store.InstanceNames(),
+		}
 	}
 
 	// Marshal the schema to preserve empty properties

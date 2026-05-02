@@ -108,6 +108,12 @@ func (gc *grafanaConfig) addFlags() {
 func (dt *disabledTools) addTools(s *server.MCPServer) {
 	enabledTools := strings.Split(dt.enabledTools, ",")
 	enableWriteTools := !dt.write
+
+	// Always register the endpoints tool when multi-instance mode is active.
+	if mcpgrafana.GlobalInstanceStore() != nil && mcpgrafana.GlobalInstanceStore().HasInstances() {
+		tools.AddEndpointsTools(s)
+	}
+
 	maybeAddTools(s, tools.AddSearchTools, enabledTools, dt.search, "search")
 	maybeAddTools(s, tools.AddDatasourceTools, enabledTools, dt.datasource, "datasource")
 	maybeAddTools(s, func(mcp *server.MCPServer) { tools.AddIncidentTools(mcp, enableWriteTools) }, enabledTools, dt.incident, "incident")
@@ -307,6 +313,14 @@ func runMetricsServer(addr string, o *observability.Observability) {
 
 func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt disabledTools, gc mcpgrafana.GrafanaConfig, tls tlsConfig, obs observability.Config, sessionIdleTimeoutMinutes int) error {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+
+	// Initialize multi-instance store from GRAFANA_INSTANCES_FILE (if set).
+	// Must happen before newServer so tool schemas include the "endpoint" parameter.
+	if instances := mcpgrafana.LoadInstancesFromEnv(); len(instances) > 0 {
+		mcpgrafana.InitInstanceStore(instances)
+		names := mcpgrafana.GlobalInstanceStore().InstanceNames()
+		slog.Info("Multi-instance mode enabled", "instances", names)
+	}
 
 	// Set up observability (metrics and tracing)
 	o, err := observability.Setup(obs)

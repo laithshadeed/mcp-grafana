@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -749,4 +750,260 @@ func TestConvertToolHandlesInterfaceFields(t *testing.T) {
 	modelObj, ok := model.(map[string]any)
 	require.True(t, ok, "model property should be an object schema, got %T", model)
 	t.Logf("model schema: %v", modelObj)
+}
+
+func TestConvertToolEndpointInjectionInSchema(t *testing.T) {
+	orig := globalInstanceStore
+	defer func() { globalInstanceStore = orig }()
+
+	globalInstanceStore = &InstanceStore{
+		instances: map[string]InstanceConfig{
+			"cde":  {URL: "https://grafana.cde.example.com", ServiceAccountToken: "tok-cde"},
+			"edge": {URL: "https://grafana.edge.example.com", ServiceAccountToken: "tok-edge"},
+		},
+		clients: make(map[string]*GrafanaClient),
+	}
+
+	tool, _, err := ConvertTool("test_tool", "A test tool", testToolHandler)
+	require.NoError(t, err)
+
+	var schema map[string]any
+	err = json.Unmarshal(tool.RawInputSchema, &schema)
+	require.NoError(t, err)
+
+	props := schema["properties"].(map[string]any)
+	endpoint, ok := props["endpoint"]
+	require.True(t, ok, "endpoint property should be injected when InstanceStore is active")
+
+	epMap := endpoint.(map[string]any)
+	assert.Equal(t, "string", epMap["type"])
+	enum, ok := epMap["enum"].([]any)
+	require.True(t, ok, "endpoint should have enum")
+	assert.Contains(t, enum, "cde")
+	assert.Contains(t, enum, "edge")
+}
+
+func TestConvertToolNoEndpointWithoutInstanceStore(t *testing.T) {
+	orig := globalInstanceStore
+	defer func() { globalInstanceStore = orig }()
+
+	globalInstanceStore = nil
+
+	tool, _, err := ConvertTool("test_tool", "A test tool", testToolHandler)
+	require.NoError(t, err)
+
+	var schema map[string]any
+	err = json.Unmarshal(tool.RawInputSchema, &schema)
+	require.NoError(t, err)
+
+	props := schema["properties"].(map[string]any)
+	_, hasEndpoint := props["endpoint"]
+	assert.False(t, hasEndpoint, "endpoint property should NOT be injected without InstanceStore")
+}
+
+func TestConvertToolEndpointResolution(t *testing.T) {
+	orig := globalInstanceStore
+	defer func() { globalInstanceStore = orig }()
+
+	instances := map[string]InstanceConfig{
+		"edge": {URL: "https://grafana.edge.example.com", ServiceAccountToken: "tok-edge"},
+	}
+	globalInstanceStore = &InstanceStore{
+		instances: instances,
+		clients:   make(map[string]*GrafanaClient),
+	}
+
+	// Create a tool that reads the config from context to verify endpoint resolution
+	type verifyParams struct {
+		Message string `json:"message" jsonschema:"required"`
+	}
+	verifyHandler := func(ctx context.Context, p verifyParams) (string, error) {
+		cfg := GrafanaConfigFromContext(ctx)
+		return "url=" + cfg.URL, nil
+	}
+
+	_, handler, err := ConvertTool("verify", "verify tool", verifyHandler)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	request := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "verify",
+			Arguments: map[string]any{
+				"endpoint": "edge",
+				"message":  "hello",
+			},
+		},
+	}
+
+	result, err := handler(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	text := result.Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "url=https://grafana.edge.example.com")
+}
+
+func TestConvertToolEndpointResolutionUnknownEndpoint(t *testing.T) {
+	orig := globalInstanceStore
+	defer func() { globalInstanceStore = orig }()
+
+	globalInstanceStore = &InstanceStore{
+		instances: map[string]InstanceConfig{
+			"cde": {URL: "https://grafana.cde.example.com", ServiceAccountToken: "tok-cde"},
+		},
+		clients: make(map[string]*GrafanaClient),
+	}
+
+	_, handler, err := ConvertTool("test_tool", "A test tool", testToolHandler)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	request := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "test_tool",
+			Arguments: map[string]any{
+				"endpoint": "nonexistent",
+				"name":     "test",
+				"value":    65,
+			},
+		},
+	}
+
+	_, err = handler(ctx, request)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown endpoint")
+}
+
+// TestRegisterInjectsEndpointAfterStoreInit reproduces the package-init race
+// that was hiding the endpoint param from every tool except list_endpoints.
+//
+// Real layout in the wild:
+//
+//	var ListDatasources = mcpgrafana.MustTool(...)   // ConvertTool runs at init
+//	func main() {
+//	    InitInstanceStore(...)                       // store populated AFTER init
+//	    ...
+//	    AddDatasourceTools(s)                        // calls ListDatasources.Register(s)
+//	}
+//
+// At ConvertTool time the store is nil, so the schema is frozen without
+// "endpoint". The fix injects at Register time, after the store is up.
+func TestRegisterInjectsEndpointAfterStoreInit(t *testing.T) {
+	orig := globalInstanceStore
+	defer func() { globalInstanceStore = orig }()
+
+	// Step 1: ConvertTool runs FIRST, with no store — mimics package init.
+	globalInstanceStore = nil
+	tool := MustTool("test_tool", "A test tool", testToolHandler)
+
+	// Confirm the cached schema has no "endpoint" yet.
+	var pre map[string]any
+	require.NoError(t, json.Unmarshal(tool.Tool.RawInputSchema, &pre))
+	preProps := pre["properties"].(map[string]any)
+	_, hasEndpoint := preProps["endpoint"]
+	require.False(t, hasEndpoint, "precondition: schema before store init should not have endpoint")
+
+	// Step 2: Initialize the store, then Register — mimics main() after init.
+	globalInstanceStore = &InstanceStore{
+		instances: map[string]InstanceConfig{
+			"cde":  {URL: "https://grafana.cde.example.com", ServiceAccountToken: "tok-cde"},
+			"edge": {URL: "https://grafana.edge.example.com", ServiceAccountToken: "tok-edge"},
+		},
+		clients: make(map[string]*GrafanaClient),
+	}
+
+	srv := server.NewMCPServer("test", "0")
+	tool.Register(srv)
+
+	// Step 3: After Register, the schema served by tools/list must have endpoint.
+	var post map[string]any
+	require.NoError(t, json.Unmarshal(tool.Tool.RawInputSchema, &post))
+	postProps := post["properties"].(map[string]any)
+	endpoint, ok := postProps["endpoint"]
+	require.True(t, ok, "Register must inject endpoint when GlobalInstanceStore is populated")
+
+	epMap := endpoint.(map[string]any)
+	assert.Equal(t, "string", epMap["type"])
+	enum := epMap["enum"].([]any)
+	assert.Contains(t, enum, "cde")
+	assert.Contains(t, enum, "edge")
+
+	// Pre-existing properties must be preserved.
+	for _, want := range []string{"name", "value", "optional"} {
+		_, kept := postProps[want]
+		assert.True(t, kept, "Register should preserve original property %q", want)
+	}
+}
+
+// TestRegisterIdempotentEndpointInject covers the case where ConvertTool
+// already injected (because the store happened to be set at that time) — a
+// second pass at Register must not corrupt the schema.
+func TestRegisterIdempotentEndpointInject(t *testing.T) {
+	orig := globalInstanceStore
+	defer func() { globalInstanceStore = orig }()
+
+	globalInstanceStore = &InstanceStore{
+		instances: map[string]InstanceConfig{
+			"cde": {URL: "https://grafana.cde.example.com", ServiceAccountToken: "tok-cde"},
+		},
+		clients: make(map[string]*GrafanaClient),
+	}
+
+	tool := MustTool("test_tool", "A test tool", testToolHandler)
+	srv := server.NewMCPServer("test", "0")
+	tool.Register(srv)
+
+	var schema map[string]any
+	require.NoError(t, json.Unmarshal(tool.Tool.RawInputSchema, &schema))
+	props := schema["properties"].(map[string]any)
+	endpoint, ok := props["endpoint"]
+	require.True(t, ok)
+	epMap := endpoint.(map[string]any)
+	enum := epMap["enum"].([]any)
+	assert.Equal(t, []any{"cde"}, enum, "enum should reflect the store at Register time, not be doubled or stale")
+}
+
+// TestRegisterDoesNothingWithoutStore confirms the no-multi-instance path
+// still produces a schema without endpoint (no spurious enum on plain installs).
+func TestRegisterDoesNothingWithoutStore(t *testing.T) {
+	orig := globalInstanceStore
+	defer func() { globalInstanceStore = orig }()
+
+	globalInstanceStore = nil
+
+	tool := MustTool("test_tool", "A test tool", testToolHandler)
+	srv := server.NewMCPServer("test", "0")
+	tool.Register(srv)
+
+	var schema map[string]any
+	require.NoError(t, json.Unmarshal(tool.Tool.RawInputSchema, &schema))
+	props := schema["properties"].(map[string]any)
+	_, hasEndpoint := props["endpoint"]
+	assert.False(t, hasEndpoint, "without an instance store, Register must not inject endpoint")
+}
+
+// TestInjectEndpointIntoSchemaPreservesOtherFields exercises the helper
+// directly — checks $defs, required, additionalProperties round-trip cleanly.
+func TestInjectEndpointIntoSchemaPreservesOtherFields(t *testing.T) {
+	original := []byte(`{
+		"type":"object",
+		"properties":{"name":{"type":"string"}},
+		"required":["name"],
+		"additionalProperties":false
+	}`)
+
+	out, err := injectEndpointIntoSchema(original, []string{"a", "b"})
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(out, &got))
+	assert.Equal(t, "object", got["type"])
+	assert.Equal(t, false, got["additionalProperties"])
+	assert.Equal(t, []any{"name"}, got["required"])
+
+	props := got["properties"].(map[string]any)
+	_, hasName := props["name"]
+	assert.True(t, hasName, "original 'name' property should survive")
+	_, hasEndpoint := props["endpoint"]
+	assert.True(t, hasEndpoint, "endpoint should be injected")
 }
